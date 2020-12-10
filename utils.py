@@ -101,3 +101,10 @@ def save_input(img, prefix, title):
     mark_inset(ax, axins, loc1=1, loc2=3, fc="none", ec="blue")
     plt.pyplot.savefig("./output/" + str(prefix) + "-" + title + ".png")
     plt.pyplot.close()
+
+
+def process_img(file_path):
+    img = tf.io.read_file(file_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.convert_image_dtype(img, tf.float32)
+    return img

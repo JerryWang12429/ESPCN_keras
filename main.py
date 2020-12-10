@@ -10,7 +10,6 @@ from tensorflow import keras
 from tensorflow.keras.preprocessing.image import load_img
 from tensorflow.keras.preprocessing.image import array_to_img
 from tensorflow.keras.preprocessing.image import img_to_array
-from tensorflow.keras.preprocessing import image_dataset_from_directory
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -19,8 +18,10 @@ from mpl_toolkits.axes_grid1.inset_locator import mark_inset
 import PIL
 
 from model import get_model
-from utils import scaling, process_target, upscale_image, plot_results, save_input
+from utils import scaling, process_target, upscale_image, plot_results, save_input, process_img
 from IPython.display import display
+from pre_proc import Crop_image
+import glob
 
 # for remote image show with X11 on MacOS
 matplotlib.use("TKAgg")
@@ -31,52 +32,47 @@ root_dir = "./BSR/BSDS500/data/"
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--crop_size', dest='crop_size', type=int, default=300)
+    parser.add_argument('--crop_image', dest='crop_image', type=bool, default=False)
+    parser.add_argument('--crop_size', dest='crop_size', type=int, default=51)
     parser.add_argument('--upscale_factor', dest='upscale_factor', type=int, default=3)
-    parser.add_argument('--batch_size', dest='batch_size', type=int, default=32)
-    parser.add_argument('--epoch', dest='epoch', type=int, default=500)
+    parser.add_argument('--batch_size', dest='batch_size', type=int, default=256)
+    parser.add_argument('--epoch', dest='epoch', type=int, default=1000)
     return parser
 
 
 class ESPCN:
 
-    def __init__(self, crop_size, upscale_factor, batch_size, epoch, input_size):
+    def __init__(self, crop_size, upscale_factor, batch_size, epoch):
         self.crop_size = crop_size
         self.upscale_factor = upscale_factor
         self.batch_size = batch_size
         self.epoch = epoch
-        self.input_size = input_size
 
-    def get_train_data(self):
-        train_ds = image_dataset_from_directory(
-            root_dir,
-            batch_size=batch_size,
-            image_size=(crop_size, crop_size),
-            validation_split=0.2,
-            subset="training",
-            seed=1337,
-            label_mode=None,
-        )
-        return train_ds
+    def get_train_data(self, root_dir):
+        x_files = glob.glob(root_dir + 'data_lowres/*.jpg')
+        y_files = glob.glob(root_dir + 'data_highres/*.jpg')
 
-    def get_valid_data(self):
-        valid_ds = image_dataset_from_directory(
-            root_dir,
-            batch_size=batch_size,
-            image_size=(crop_size, crop_size),
-            validation_split=0.2,
-            subset="validation",
-            seed=1337,
-            label_mode=None,
-        )
-        return valid_ds
+        files_ds = tf.data.Dataset.from_tensor_slices((x_files, y_files))
+        train_dataset = files_ds.take(int(0.8 * len(files_ds)))
+        valid_dataset = files_ds.skip(int(0.8 * len(files_ds)))
+
+        train_dataset = train_dataset.map(lambda x, y: (process_img(x), process_img(y)))
+        valid_dataset = valid_dataset.map(lambda x, y: (process_img(x), process_img(y)))
+
+        print("Load  " + str(len(train_dataset)) + "  Image for training")
+        print("Load  " + str(len(valid_dataset)) + "  Image for validation")
+
+        train_dataset = train_dataset.batch(self.batch_size)
+        valid_dataset = valid_dataset.batch(self.batch_size)
+
+        return train_dataset, valid_dataset
 
     # Use TF Ops to process.
     def process_input(self, input):
         input = tf.image.rgb_to_yuv(input)
         last_dimension_axis = len(input.shape) - 1
         y, u, v = tf.split(input, 3, axis=last_dimension_axis)
-        return tf.image.resize(y, [input_size, input_size], method="area")
+        return y
 
     def get_lowres_image(self, img):
         """Return low-resolution image to use as model input."""
@@ -108,22 +104,25 @@ class ESPCNCallback(keras.callbacks.Callback):
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
+    crop_image = args.crop_image
     crop_size = args.crop_size
     upscale_factor = args.upscale_factor
     batch_size = args.batch_size
     epoch = args.epoch
-    input_size = args.crop_size // args.upscale_factor
-
-    espcn = ESPCN(crop_size, upscale_factor, batch_size, epoch, input_size)
-
-    # Scale from (0, 255) to (0, 1)
-    train_ds = espcn.get_train_data()
-    train_ds = train_ds.map(scaling)
-    valid_ds = espcn.get_valid_data()
-    valid_ds = valid_ds.map(scaling)
 
     dataset = os.path.join(root_dir, "images")
     test_path = os.path.join(dataset, "test")
+
+    if crop_image:
+        print('Starting pre-crop image into patch')
+        pre_process = Crop_image(root_dir, crop_size, upscale_factor)
+        pre_process.save_patch()
+
+    root_dir = './data_cropped/'
+    espcn = ESPCN(crop_size, upscale_factor, batch_size, epoch)
+
+    # Scale from (0, 255) to (0, 1)
+    train_ds, valid_ds = espcn.get_train_data(root_dir)
 
     test_img_paths = sorted(
         [
@@ -133,17 +132,21 @@ if __name__ == "__main__":
         ]
     )
 
+    train_ds = train_ds.map(lambda x, y: (scaling(x), scaling(y)))
+    valid_ds = valid_ds.map(lambda x, y: (scaling(x), scaling(y)))
+
     train_ds = train_ds.map(
-        lambda x: (espcn.process_input(x), process_target(x))
+        lambda x, y: (espcn.process_input(x), process_target(y))
     )
+
     train_ds = train_ds.prefetch(buffer_size=32)
 
     valid_ds = valid_ds.map(
-        lambda x: (espcn.process_input(x), process_target(x))
+        lambda x, y: (espcn.process_input(x), process_target(y))
     )
-    valid_ds = valid_ds.prefetch(buffer_size=32)
 
-    early_stopping_callback = keras.callbacks.EarlyStopping(monitor="loss", patience=10)
+    valid_ds = valid_ds.prefetch(buffer_size=32)
+    early_stopping_callback = keras.callbacks.EarlyStopping(monitor="loss", patience=100)
     checkpoint_filepath = "./tmp/checkpoint"
 
     model_checkpoint_callback = keras.callbacks.ModelCheckpoint(
@@ -158,7 +161,7 @@ if __name__ == "__main__":
     model.summary()
 
     callbacks = [ESPCNCallback(), early_stopping_callback, model_checkpoint_callback]
-    loss_fn = keras.losses.MeanSquaredError()
+    loss_fn = keras.losses.MeanAbsoluteError()
     optimizer = keras.optimizers.Adam(learning_rate=0.001)
 
     model.compile(
@@ -167,9 +170,16 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    model.fit(
-        train_ds, epochs=epoch, callbacks=callbacks, validation_data=valid_ds, verbose=2
-    )
+    history = model.fit(train_ds, epochs=epoch, callbacks=callbacks, validation_data=valid_ds, verbose=2)
+
+    plt.plot(history.history['loss'])
+    plt.plot(history.history['val_loss'])
+    plt.title('Model loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Val'], loc='upper left')
+    plt.savefig('Loss.png')
+    plt.close()
 
     print("--- %s seconds ---" % (time.time() - start_time))
 
@@ -180,7 +190,7 @@ if __name__ == "__main__":
     total_bicubic_ssim = 0.0
     total_test_ssim = 0.0
 
-    for index, test_img_path in enumerate(test_img_paths[50:60]):
+    for index, test_img_path in enumerate(test_img_paths):
         img = load_img(test_img_path)
         lowres_input = espcn.get_lowres_image(img)
         save_input(lowres_input, index, "input")
@@ -210,7 +220,7 @@ if __name__ == "__main__":
         plot_results(highres_img, index, "highres")
         plot_results(prediction, index, "prediction")
 
-    print("Avg. PSNR of lowres images is %.4f" % (total_bicubic_psnr / 10))
-    print("Avg. PSNR of reconstructions is %.4f" % (total_test_psnr / 10))
-    print("Avg. SSIM of lowres images is %.4f" % (total_bicubic_ssim / 10))
-    print("Avg. SSIM of reconstructions is %.4f" % (total_test_ssim / 10))
+    print("Avg. PSNR of lowres images is %.4f" % (total_bicubic_psnr / 200))
+    print("Avg. PSNR of reconstructions is %.4f" % (total_test_psnr / 200))
+    print("Avg. SSIM of lowres images is %.4f" % (total_bicubic_ssim / 200))
+    print("Avg. SSIM of reconstructions is %.4f" % (total_test_ssim / 200))
